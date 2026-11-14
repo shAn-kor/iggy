@@ -132,7 +132,9 @@ fn get_command(
                 args.stream_id.clone(),
                 args.output.into(),
             )),
-            StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.output().into())),
+            StreamAction::List(args) => {
+                Box::new(GetStreamsCmd::new(args.list_output.output().into()))
+            }
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -162,7 +164,7 @@ fn get_command(
             )),
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
-                args.output().into(),
+                args.list_output.output().into(),
             )),
         },
         Command::Partition(command) => match command {

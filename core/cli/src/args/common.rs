@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use clap::ValueEnum;
+use clap::{Args, ValueEnum};
 use iggy::prelude::OptionKey;
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
@@ -126,6 +126,24 @@ impl From<ListOutput> for GetTopicsOutput {
             ListOutput::List => GetTopicsOutput::List,
             ListOutput::Json => GetTopicsOutput::Json,
         }
+    }
+}
+
+/// List flags shared by commands that can print JSON.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ListOutputArgs {
+    /// List mode (table or list)
+    #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
+    pub(crate) list_mode: ListMode,
+
+    /// Output format (table, list or json), cannot be combined with --list-mode
+    #[clap(short, long, value_enum, conflicts_with = "list_mode")]
+    pub(crate) output: Option<ListOutput>,
+}
+
+impl ListOutputArgs {
+    pub(crate) fn output(&self) -> ListOutput {
+        self.output.unwrap_or_else(|| self.list_mode.into())
     }
 }
 

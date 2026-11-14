@@ -67,7 +67,7 @@ pub trait CliCommand: Send {
 ///
 /// Bypasses [`PRINT_TARGET`] on purpose: JSON was asked for explicitly, so
 /// `--quiet` must not hide it.
-pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+pub(crate) fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
     let stdout = io::stdout();
     writeln!(stdout.lock(), "{}", serde_json::to_string_pretty(value)?)?;
     Ok(())

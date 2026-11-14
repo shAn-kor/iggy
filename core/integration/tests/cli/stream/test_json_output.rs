@@ -15,41 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
-use assert_cmd::assert::Assert;
+use crate::cli::common::json_output::{JsonCase, JsonOutputTarget, run_json_output_cases};
 use async_trait::async_trait;
 use iggy::prelude::{Client, StreamCreateOptions};
 use serde_json::Value;
 use serial_test::parallel;
 
 #[derive(Clone, Copy)]
-enum Case {
-    Get,
-    List,
-    Empty,
-    Missing,
-    Conflict,
-    Table,
-    TextList,
-}
-
-struct JsonCase {
-    case: Case,
-    quiet: bool,
-    expected: Option<Value>,
-}
+struct StreamTarget;
 
 #[async_trait]
-impl IggyCmdTestCase for JsonCase {
-    async fn prepare_server_state(&mut self, client: &dyn Client) {
-        if !matches!(self.case, Case::Empty | Case::Missing | Case::Conflict) {
+impl JsonOutputTarget for StreamTarget {
+    const ITEM_NAME: &'static str = "json-stream";
+
+    async fn prepare(&self, case: JsonCase, client: &dyn Client) {
+        if !matches!(
+            case,
+            JsonCase::Empty | JsonCase::Missing | JsonCase::Conflict
+        ) {
             client
                 .create_stream("json-stream", &StreamCreateOptions::default())
                 .await
                 .unwrap();
         }
-        self.expected = match self.case {
-            Case::Get => Some(
+    }
+
+    async fn expected(&self, case: JsonCase, client: &dyn Client) -> Option<Value> {
+        match case {
+            JsonCase::Get => Some(
                 serde_json::to_value(
                     client
                         .get_stream(&"json-stream".try_into().unwrap())
@@ -59,68 +52,30 @@ impl IggyCmdTestCase for JsonCase {
                 )
                 .unwrap(),
             ),
-            Case::List | Case::Empty => {
+            JsonCase::List | JsonCase::Empty => {
                 Some(serde_json::to_value(client.get_streams().await.unwrap()).unwrap())
             }
             _ => None,
+        }
+    }
+
+    fn args(&self, case: JsonCase) -> Vec<&'static str> {
+        let args = match case {
+            JsonCase::Get => vec!["get", "json-stream", "-o", "json"],
+            JsonCase::Missing => vec!["get", "missing-stream", "-o", "json"],
+            JsonCase::List | JsonCase::Empty => vec!["list", "-o", "json"],
+            JsonCase::Conflict => vec!["list", "-l", "list", "-o", "json"],
+            JsonCase::Table => vec!["list", "-o", "table"],
+            JsonCase::TextList => vec!["list", "-o", "list"],
         };
+        [vec!["stream"], args].concat()
     }
 
-    fn get_command(&self) -> IggyCmdCommand {
-        let mut command = IggyCmdCommand::new().with_env_credentials();
-        if self.quiet {
-            command = command.opt("-q");
-        }
-        command = command.arg("stream");
-        command = match self.case {
-            Case::Get => command.args(vec!["get", "json-stream", "-o", "json"]),
-            Case::Missing => command.args(vec!["get", "missing-stream", "-o", "json"]),
-            Case::List | Case::Empty => command.args(vec!["list", "-o", "json"]),
-            Case::Conflict => command.args(vec!["list", "-l", "list", "-o", "json"]),
-            Case::Table => command.args(vec!["list", "-o", "table"]),
-            Case::TextList => command.args(vec!["list", "-o", "list"]),
-        };
-        command
-    }
-
-    fn verify_command(&self, command_state: Assert) {
-        if matches!(self.case, Case::Missing | Case::Conflict) {
-            let output = command_state.failure();
-            assert!(output.get_output().stdout.is_empty());
-            let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-            if matches!(self.case, Case::Missing) {
-                assert!(stderr.contains("not found"), "{stderr}");
-            } else {
-                assert!(stderr.contains("cannot be used with"), "{stderr}");
-            }
-            return;
-        }
-        let output = command_state.success();
-        let stdout = &output.get_output().stdout;
-        if matches!(self.case, Case::Table | Case::TextList) {
-            assert!(String::from_utf8_lossy(stdout).contains("json-stream"));
-            return;
-        }
-        let value: Value = serde_json::from_slice(stdout).expect("stdout must be one JSON value");
-        assert_eq!(value, *self.expected.as_ref().unwrap());
-        match self.case {
-            Case::Get => assert_eq!(value["name"], "json-stream"),
-            Case::List => assert!(
-                value
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|item| item["name"] == "json-stream")
-            ),
-            Case::Empty => assert_eq!(value, serde_json::json!([])),
-            _ => unreachable!(),
-        }
-        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-        assert_eq!(stderr.contains("Executing "), !self.quiet, "{stderr}");
-    }
-
-    async fn verify_server_state(&self, client: &dyn Client) {
-        if !matches!(self.case, Case::Empty | Case::Missing | Case::Conflict) {
+    async fn cleanup(&self, case: JsonCase, client: &dyn Client) {
+        if !matches!(
+            case,
+            JsonCase::Empty | JsonCase::Missing | JsonCase::Conflict
+        ) {
             client
                 .delete_stream(&"json-stream".try_into().unwrap())
                 .await
@@ -132,29 +87,7 @@ impl IggyCmdTestCase for JsonCase {
 #[tokio::test]
 #[parallel]
 async fn given_stream_output_when_requested_should_preserve_json_and_output_modes() {
-    let mut test = IggyCmdTest::default();
-    test.setup().await;
-    for case in [
-        Case::Get,
-        Case::List,
-        Case::Empty,
-        Case::Missing,
-        Case::Conflict,
-        Case::Table,
-        Case::TextList,
-    ] {
-        for quiet in [false, true] {
-            if quiet && matches!(case, Case::Table | Case::TextList) {
-                continue;
-            }
-            test.execute_test(JsonCase {
-                case,
-                quiet,
-                expected: None,
-            })
-            .await;
-        }
-    }
+    run_json_output_cases(StreamTarget).await;
 }
 
 #[cfg(target_os = "linux")]
@@ -162,8 +95,8 @@ mod stdout_errors {
     use std::fs::OpenOptions;
     use std::process::Command;
 
-    use assert_cmd::prelude::CommandCargoExt;
     use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+    use integration::harness::cargo_bin_path;
     use serial_test::parallel;
 
     use crate::cli::common::IggyCmdTest;
@@ -176,9 +109,7 @@ mod stdout_errors {
         let address = test.get_tcp_server_address().unwrap();
         let stdout = OpenOptions::new().write(true).open("/dev/full").unwrap();
 
-        #[allow(deprecated)]
-        let output = Command::cargo_bin("iggy")
-            .unwrap()
+        let output = Command::new(cargo_bin_path("iggy").unwrap())
             .env("IGGY_USERNAME", DEFAULT_ROOT_USERNAME)
             .env("IGGY_PASSWORD", DEFAULT_ROOT_PASSWORD)
             .env("IGGY_TOKEN", "")

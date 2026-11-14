@@ -15,38 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
-use assert_cmd::assert::Assert;
+use crate::cli::common::json_output::{JsonCase, JsonOutputTarget, run_json_output_cases};
 use async_trait::async_trait;
 use iggy::prelude::{Client, StreamCreateOptions, TopicCreateOptions};
 use serde_json::Value;
 use serial_test::parallel;
 
 #[derive(Clone, Copy)]
-enum Case {
-    Get,
-    List,
-    Empty,
-    Missing,
-    Conflict,
-    Table,
-    TextList,
-}
-
-struct JsonCase {
-    case: Case,
-    quiet: bool,
-    expected: Option<Value>,
-}
+struct TopicTarget;
 
 #[async_trait]
-impl IggyCmdTestCase for JsonCase {
-    async fn prepare_server_state(&mut self, client: &dyn Client) {
+impl JsonOutputTarget for TopicTarget {
+    const ITEM_NAME: &'static str = "json-topic";
+
+    async fn prepare(&self, case: JsonCase, client: &dyn Client) {
         client
             .create_stream("json-stream", &StreamCreateOptions::default())
             .await
             .unwrap();
-        if !matches!(self.case, Case::Empty | Case::Missing | Case::Conflict) {
+        if !matches!(
+            case,
+            JsonCase::Empty | JsonCase::Missing | JsonCase::Conflict
+        ) {
             client
                 .create_topic(
                     &"json-stream".try_into().unwrap(),
@@ -59,8 +49,11 @@ impl IggyCmdTestCase for JsonCase {
                 .await
                 .unwrap();
         }
-        self.expected = match self.case {
-            Case::Get => Some(
+    }
+
+    async fn expected(&self, case: JsonCase, client: &dyn Client) -> Option<Value> {
+        match case {
+            JsonCase::Get => Some(
                 serde_json::to_value(
                     client
                         .get_topic(
@@ -73,7 +66,7 @@ impl IggyCmdTestCase for JsonCase {
                 )
                 .unwrap(),
             ),
-            Case::List | Case::Empty => Some(
+            JsonCase::List | JsonCase::Empty => Some(
                 serde_json::to_value(
                     client
                         .get_topics(&"json-stream".try_into().unwrap())
@@ -83,84 +76,59 @@ impl IggyCmdTestCase for JsonCase {
                 .unwrap(),
             ),
             _ => None,
-        };
+        }
     }
 
-    fn get_command(&self) -> IggyCmdCommand {
-        let mut command = IggyCmdCommand::new().with_env_credentials();
-        if self.quiet {
-            command = command.opt("-q");
-        }
-        command = command.arg("topic");
-        command = match self.case {
-            Case::Get => command.args(vec!["get", "json-stream", "json-topic", "-o", "json"]),
-            Case::Missing => {
-                command.args(vec!["get", "json-stream", "missing-topic", "-o", "json"])
-            }
-            Case::List | Case::Empty => command.args(vec!["list", "json-stream", "-o", "json"]),
-            Case::Conflict => command.args(vec!["list", "json-stream", "-l", "list", "-o", "json"]),
-            Case::Table => command.args(vec!["list", "json-stream", "-o", "table"]),
-            Case::TextList => command.args(vec!["list", "json-stream", "-o", "list"]),
+    fn args(&self, case: JsonCase) -> Vec<&'static str> {
+        let args = match case {
+            JsonCase::Get => vec!["get", "json-stream", "json-topic", "-o", "json"],
+            JsonCase::Missing => vec!["get", "json-stream", "missing-topic", "-o", "json"],
+            JsonCase::List | JsonCase::Empty => vec!["list", "json-stream", "-o", "json"],
+            JsonCase::Conflict => vec!["list", "json-stream", "-l", "list", "-o", "json"],
+            JsonCase::Table => vec!["list", "json-stream", "-o", "table"],
+            JsonCase::TextList => vec!["list", "json-stream", "-o", "list"],
         };
-        command
+        [vec!["topic"], args].concat()
     }
 
-    fn verify_command(&self, command_state: Assert) {
-        if matches!(self.case, Case::Missing | Case::Conflict) {
-            let output = command_state.failure();
-            assert!(output.get_output().stdout.is_empty());
-            let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-            if matches!(self.case, Case::Missing) {
-                assert!(stderr.contains("not found"), "{stderr}");
-            } else {
-                assert!(stderr.contains("cannot be used with"), "{stderr}");
-            }
+    fn align_expected(&self, case: JsonCase, actual: &Value, expected: &mut Value) {
+        if !matches!(case, JsonCase::Get) {
             return;
         }
-        let output = command_state.success();
-        let stdout = &output.get_output().stdout;
-        if matches!(self.case, Case::Table | Case::TextList) {
-            assert!(String::from_utf8_lossy(stdout).contains("json-topic"));
-            return;
-        }
-        let value: Value = serde_json::from_slice(stdout).expect("stdout must be one JSON value");
-        let mut expected = self.expected.as_ref().unwrap().clone();
-        if matches!(self.case, Case::Get) {
-            for (actual_partition, expected_partition) in value["partitions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .zip(expected["partitions"].as_array_mut().unwrap())
-            {
-                let metadata_op = actual_partition["context"]["metadata_op"].as_u64().unwrap();
-                assert!(
-                    metadata_op
-                        >= expected_partition["context"]["metadata_op"]
-                            .as_u64()
-                            .unwrap()
-                );
-                expected_partition["context"]["metadata_op"] = metadata_op.into();
-            }
-        }
-        assert_eq!(value, expected);
-        match self.case {
-            Case::Get => assert_eq!(value["name"], "json-topic"),
-            Case::List => assert!(
-                value
+        for (actual_partition, expected_partition) in actual["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(expected["partitions"].as_array_mut().unwrap())
+        {
+            let metadata_op = actual_partition["context"]["metadata_op"].as_u64().unwrap();
+            assert!(
+                metadata_op
+                    >= expected_partition["context"]["metadata_op"]
+                        .as_u64()
+                        .unwrap()
+            );
+            expected_partition["context"]["metadata_op"] = metadata_op.into();
+
+            // Replicas can join the ISR between the server read and the CLI run.
+            let members = expected_partition["members"].as_array().unwrap();
+            let in_sync_members = &actual_partition["in_sync_members"];
+            assert!(
+                in_sync_members
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|item| item["name"] == "json-topic")
-            ),
-            Case::Empty => assert_eq!(value, serde_json::json!([])),
-            _ => unreachable!(),
+                    .all(|member| members.contains(member))
+            );
+            expected_partition["in_sync_members"] = in_sync_members.clone();
         }
-        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-        assert_eq!(stderr.contains("Executing "), !self.quiet, "{stderr}");
     }
 
-    async fn verify_server_state(&self, client: &dyn Client) {
-        if !matches!(self.case, Case::Empty | Case::Missing | Case::Conflict) {
+    async fn cleanup(&self, case: JsonCase, client: &dyn Client) {
+        if !matches!(
+            case,
+            JsonCase::Empty | JsonCase::Missing | JsonCase::Conflict
+        ) {
             client
                 .delete_topic(
                     &"json-stream".try_into().unwrap(),
@@ -179,27 +147,5 @@ impl IggyCmdTestCase for JsonCase {
 #[tokio::test]
 #[parallel]
 async fn given_topic_output_when_requested_should_preserve_json_and_output_modes() {
-    let mut test = IggyCmdTest::default();
-    test.setup().await;
-    for case in [
-        Case::Get,
-        Case::List,
-        Case::Empty,
-        Case::Missing,
-        Case::Conflict,
-        Case::Table,
-        Case::TextList,
-    ] {
-        for quiet in [false, true] {
-            if quiet && matches!(case, Case::Table | Case::TextList) {
-                continue;
-            }
-            test.execute_test(JsonCase {
-                case,
-                quiet,
-                expected: None,
-            })
-            .await;
-        }
-    }
+    run_json_output_cases(TopicTarget).await;
 }
